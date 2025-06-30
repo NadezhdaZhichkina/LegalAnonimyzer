@@ -1,46 +1,35 @@
 import re
-import fitz
+import pdfplumber
 from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
 import streamlit as st
-from io import BytesIO, StringIO
+from io import BytesIO
 
 # === Маскировка ===
 def remove_sensitive_data(text):
     patterns = [
-        # ФИО в формате: Иванов Иван Иванович
         r'\b[А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+\b',
-        # Иванов И.И.
         r'\b[А-ЯЁ][а-яё]+ [А-ЯЁ]\.[А-ЯЁ]\.\b',
-        # И.О. Иванов
         r'\b[А-ЯЁ]\.[А-ЯЁ]\. ?[А-ЯЁ][а-яё]+\b',
-        # ИНН, ОГРН, КПП
         r'\bИНН ?\d{10,12}\b',
         r'\bОГРН ?\d{13}\b',
         r'\bКПП ?\d{9}\b',
-        # Email
+        r'\b\d{2} \d{2} \d{6}\b',               # Паспорт РФ
+        r'\b\d{3}-\d{3}-\d{3} \d{2}\b',         # СНИЛС
+        r'\b\d{2}\.\d{2}\.\d{4}\b',             # Дата рождения
         r'\b[\w\.-]+@[\w\.-]+\.\w+\b',
-        # Телефоны
         r'(?:(?:8|\+7)[\s\-]?)?\(?\d{3,4}\)?[\s\-]?\d{2,3}[\s\-]?\d{2}[\s\-]?\d{2,4}',
-        # URL и домены
         r'https?://[^\s,]+',
         r'\b[\w\.-]+\.(ru|com|pdf|org|net)\b',
-        # Адреса
         r'(?i)(юридический|почтовый)?\s*адрес\s*[:\-\u2013\u2014]?\s*[^\n\r]*',
         r'(?i)местонахождение\s*[:\-\u2013\u2014]?\s*[^\n\r]*',
         r'г\.\s?[А-ЯЁа-яё]+,\s?ул\.\s?[А-ЯЁа-яё\s]+,\s?д\.\d+[\w]?,?\s?(стр\.|корп\.|оф\.)?\d*',
-        # Банковские реквизиты
         r'(?i)(расчетный счет|р/с|к/с|кор/с|корреспондентский счет)[^\n\r]*',
-        # Наименования организаций
-        # 1. Сокращённые правовые формы с вложенными кавычками
-        r'(?i)\b(ООО|АО|ПАО|ОАО|ЗАО|ИП|ТСЖ|МУП|ГУП|НКО|МКА|СНТ|ПК|КФХ|ГМК)\s+[«"„“][^»”"]+[»”"](?:\s*[«"„“][^»”"]+[»”"])*',
-        # 2. Полные правовые формы с вложенными кавычками
-        r'(?i)(Общество с ограниченной ответственностью|публичное акционерное общество|непубличное акционерное общество|акционерное общество|индивидуальный предприниматель|Муниципальное унитарное предприятие|Государственное унитарное предприятие|Некоммерческая организация|Московская коллегия адвокатов|Адвокатская контора)\s+[«"„“][^»”"]+[»”"](?:\s*[«"„“][^»”"]+[»”"])*',
-        # 3. Организации без кавычек, но с правовой формой в конце
+        r'(?i)\b(ООО|АО|ПАО|ОАО|ЗАО|ИП|ТСЖ|МУП|ГУП|НКО|МКА|СНТ|ПК|КФХ)\s*[«„“"‟”][^«»„“"‟”]*[»”"]',
+        r'(?i)(Общество с ограниченной ответственностью|публичное акционерное общество|непубличное акционерное общество|акционерное общество|индивидуальный предприниматель|Муниципальное унитарное предприятие|Государственное унитарное предприятие|Некоммерческая организация|Московская коллегия адвокатов|Адвокатская контора)\s*[“"«„“‟”][^«»„“"‟”]*[”"»“”]',
         r'(?i)[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)+\s+(акционерное общество|публичное акционерное общество|непубличное акционерное общество|общество с ограниченной ответственностью)',
     ]
-
     replacements = {}
     for i, pattern in enumerate(patterns):
         def repl(match):
@@ -50,20 +39,18 @@ def remove_sensitive_data(text):
         text = re.sub(pattern, repl, text)
     return text, replacements
 
-# === Восстановление ===
 def restore_sensitive_data(text, replacements):
     for key, original in replacements.items():
         text = text.replace(key, original)
     return text
 
-# === Установка шрифта ===
 def set_font(paragraph):
     for run in paragraph.runs:
         run.font.name = 'Arial'
         run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Arial')
         run.font.size = Pt(11)
 
-# === Обработка DOCX ===
+# === DOCX обработка ===
 def sanitize_docx(file_bytes):
     file_bytes.seek(0)
     doc = Document(BytesIO(file_bytes.read()))
@@ -103,19 +90,35 @@ def restore_docx(file_bytes, replacements):
     buffer.seek(0)
     return buffer
 
-# === Обработка PDF ===
-def sanitize_pdf(file_bytes):
-    pdf_in = fitz.open(stream=file_bytes.read(), filetype='pdf')
-    pdf_out = fitz.open()
+# === PDF → DOCX через pdfplumber ===
+def convert_pdfplumber_to_docx(file_bytes):
+    file_bytes.seek(0)
+    doc = Document()
     full_replacements = {}
-    for page in pdf_in:
-        text = page.get_text()
-        new_text, replacements = remove_sensitive_data(text)
-        full_replacements.update(replacements)
-        new_page = pdf_out.new_page(width=page.rect.width, height=page.rect.height)
-        new_page.insert_text((50, 50), new_text, fontsize=11, fontname="helv")
+
+    with pdfplumber.open(file_bytes) as pdf:
+        for page in pdf.pages:
+            # Текст
+            text = page.extract_text()
+            if text:
+                for line in text.split("\n"):
+                    clean_text, replacements = remove_sensitive_data(line)
+                    para = doc.add_paragraph(clean_text)
+                    set_font(para)
+                    full_replacements.update(replacements)
+
+            # Таблицы
+            for table in page.extract_tables():
+                doc_table = doc.add_table(rows=0, cols=len(table[0]))
+                for row_data in table:
+                    row = doc_table.add_row().cells
+                    for i, cell in enumerate(row_data):
+                        clean_text, replacements = remove_sensitive_data(cell or "")
+                        row[i].text = clean_text
+                        full_replacements.update(replacements)
+
     buffer = BytesIO()
-    pdf_out.save(buffer)
+    doc.save(buffer)
     buffer.seek(0)
     return buffer, full_replacements
 
@@ -150,8 +153,8 @@ with tab1:
             output, replacements = sanitize_docx(uploaded_file)
             filename = "обезличенный.docx"
         elif filetype == "pdf":
-            output, replacements = sanitize_pdf(uploaded_file)
-            filename = "обезличенный.pdf"
+            output, replacements = convert_pdfplumber_to_docx(uploaded_file)
+            filename = "обезличенный.docx"
         else:
             st.error("Неподдерживаемый формат.")
             st.stop()
